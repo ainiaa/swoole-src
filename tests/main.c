@@ -18,6 +18,7 @@ int main(int argc, char **argv)
 
 	swUnitTest_steup(server_test, 1, "socket server test");
 	swUnitTest_steup(client_test, 1, "socket client test");
+    swUnitTest_steup(dnslookup_test, 1, "dns lookup test");
 
 	swUnitTest_steup(chan_test, 1, "channel test");
 

@@ -8,7 +8,7 @@
   | http://www.apache.org/licenses/LICENSE-2.0.html                      |
   | If you did not receive a copy of the Apache2.0 license and are unable|
   | to obtain it through the world-wide-web, please send a note to       |
-  | license@php.net so we can mail you a copy immediately.               |
+  | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
   | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
   +----------------------------------------------------------------------+
@@ -17,29 +17,34 @@
 #include "swoole.h"
 #include "Server.h"
 
-static int swProcessPool_worker_start(swProcessPool *pool, swWorker *worker);
+static int swProcessPool_worker_loop(swProcessPool *pool, swWorker *worker);
 static void swProcessPool_free(swProcessPool *pool);
 
 /**
  * Process manager
  */
-int swProcessPool_create(swProcessPool *pool, int worker_num, int max_request, key_t msgqueue_key, int create_pipe)
+int swProcessPool_create(swProcessPool *pool, int worker_num, int max_request, key_t msgqueue_key, int ipc_type)
 {
     bzero(pool, sizeof(swProcessPool));
 
     pool->worker_num = worker_num;
     pool->max_request = max_request;
 
-    if (msgqueue_key > 0)
+    if (ipc_type == SW_IPC_MSGQUEUE)
     {
         pool->use_msgqueue = 1;
         pool->msgqueue_key = msgqueue_key;
+    }
+    else
+    {
+        pool->use_msgqueue = 0;
+        pool->msgqueue_key = 0;
     }
     
     pool->workers = SwooleG.memory_pool->alloc(SwooleG.memory_pool, worker_num * sizeof(swWorker));
     if (pool->workers == NULL)
     {
-        swWarn("malloc[1] failed.");
+        swSysError("malloc[1] failed.");
         return SW_ERR;
     }
 
@@ -49,15 +54,22 @@ int swProcessPool_create(swProcessPool *pool, int worker_num, int max_request, k
         return SW_ERR;
     }
 
+    pool->queue = sw_malloc(sizeof(swMsgQueue));
+    if (pool->queue == NULL)
+    {
+        swSysError("malloc[2] failed.");
+        return SW_ERR;
+    }
+
     int i;
     if (pool->use_msgqueue)
     {
-        if (swQueueMsg_create(&pool->queue, 1, pool->msgqueue_key, 1) < 0)
+        if (swMsgQueue_create(pool->queue, 1, pool->msgqueue_key, 1) < 0)
         {
             return SW_ERR;
         }
     }
-    else if (create_pipe)
+    else
     {
         pool->pipes = sw_calloc(worker_num, sizeof(swPipe));
         if (pool->pipes == NULL)
@@ -75,14 +87,12 @@ int swProcessPool_create(swProcessPool *pool, int worker_num, int max_request, k
             {
                 return SW_ERR;
             }
-
             pool->workers[i].pipe_master = pipe->getFd(pipe, SW_PIPE_MASTER);
             pool->workers[i].pipe_worker = pipe->getFd(pipe, SW_PIPE_WORKER);
             pool->workers[i].pipe_object = pipe;
-            
         }
     }
-    pool->main_loop = swProcessPool_worker_start;
+    pool->main_loop = swProcessPool_worker_loop;
     return SW_OK;
 }
 
@@ -96,6 +106,7 @@ int swProcessPool_start(swProcessPool *pool)
     {
         pool->workers[i].pool = pool;
         pool->workers[i].id = pool->start_id + i;
+        pool->workers[i].type = pool->type;
 
         if (swProcessPool_spawn(&(pool->workers[i])) < 0)
         {
@@ -103,6 +114,27 @@ int swProcessPool_start(swProcessPool *pool)
         }
     }
     return SW_OK;
+}
+
+static sw_inline int swProcessPool_schedule(swProcessPool *pool)
+{
+    if (pool->dispatch_mode == SW_DISPATCH_QUEUE)
+    {
+        return 0;
+    }
+
+    int i, target_worker_id = 0;
+    int run_worker_num = pool->run_worker_num;
+
+    for (i = 0; i < run_worker_num + 1; i++)
+    {
+        target_worker_id = sw_atomic_fetch_add(&pool->round_id, 1) % run_worker_num;
+        if (pool->workers[target_worker_id].status == SW_WORKER_IDLE)
+        {
+            break;
+        }
+    }
+    return target_worker_id;
 }
 
 /**
@@ -115,28 +147,14 @@ int swProcessPool_dispatch(swProcessPool *pool, swEventData *data, int *dst_work
 
     if (*dst_worker_id < 0)
     {
-        int i, target_worker_id = pool->round_id;
-        int run_worker_num = pool->run_worker_num;
-
-        for (i = 0; i < run_worker_num; i++)
-        {
-            pool->round_id++;
-            target_worker_id = pool->round_id % run_worker_num;
-
-            worker = &pool->workers[i];
-            if (worker->status == SW_WORKER_IDLE)
-            {
-                break;
-            }
-        }
-        *dst_worker_id = target_worker_id;
+        *dst_worker_id = swProcessPool_schedule(pool);
     }
 
     *dst_worker_id += pool->start_id;
     worker = swProcessPool_get_worker(pool, *dst_worker_id);
 
     int sendn = sizeof(data->info) + data->info.len;
-    ret = swWorker_send2worker(worker, SW_PIPE_MASTER, data, sendn);
+    ret = swWorker_send2worker(worker, data, sendn, SW_PIPE_MASTER | SW_PIPE_NONBLOCK);
 
     if (ret >= 0)
     {
@@ -150,20 +168,57 @@ int swProcessPool_dispatch(swProcessPool *pool, swEventData *data, int *dst_work
     return ret;
 }
 
+/**
+ * dispatch data to worker
+ */
+int swProcessPool_dispatch_blocking(swProcessPool *pool, swEventData *data, int *dst_worker_id)
+{
+    int ret = 0;
+    swWorker *worker;
+
+    if (*dst_worker_id < 0)
+    {
+        *dst_worker_id = swProcessPool_schedule(pool);
+    }
+
+    *dst_worker_id += pool->start_id;
+    worker = swProcessPool_get_worker(pool, *dst_worker_id);
+
+    int sendn = sizeof(data->info) + data->info.len;
+    ret = swWorker_send2worker(worker, data, sendn, SW_PIPE_MASTER);
+
+    if (ret < 0)
+    {
+        swWarn("send %d bytes to worker#%d failed.", sendn, *dst_worker_id);
+    }
+    else
+    {
+        sw_atomic_fetch_add(&worker->tasking_num, 1);
+    }
+
+    return ret;
+}
+
 void swProcessPool_shutdown(swProcessPool *pool)
 {
     int i, status;
     swWorker *worker;
     SwooleG.running = 0;
 
+	swSignal_none();
+    //concurrent kill
     for (i = 0; i < pool->run_worker_num; i++)
     {
         worker = &pool->workers[i];
-        if (kill(worker->pid, SIGTERM) < 0)
+        if (swKill(worker->pid, SIGTERM) < 0)
         {
             swSysError("kill(%d) failed.", worker->pid);
             continue;
         }
+    }
+    for (i = 0; i < pool->run_worker_num; i++)
+    {
+        worker = &pool->workers[i];
         if (swWaitpid(worker->pid, &status, 0) < 0)
         {
             swSysError("waitpid(%d) failed.", worker->pid);
@@ -177,10 +232,6 @@ pid_t swProcessPool_spawn(swWorker *worker)
     pid_t pid = fork();
     swProcessPool *pool = worker->pool;
 
-    struct passwd *passwd;
-    struct group *group;
-    int is_root = !geteuid();
-
     switch (pid)
     {
     //child
@@ -188,41 +239,6 @@ pid_t swProcessPool_spawn(swWorker *worker)
         /**
          * Process start
          */
-        if(is_root) 
-        {
-            if(SwooleG.group)
-            {
-                group  = getgrnam(SwooleG.group);
-                if(group != NULL) 
-                {
-                    if(0 > setgid(group->gr_gid)) 
-                    {
-                        swSysError("setgid to [%s] failed.", SwooleG.group);
-                    }
-                }
-                else
-                {
-                    swSysError("get group [%s] info failed.", SwooleG.group);
-                }
-            }
-
-            if(SwooleG.user)
-            {
-                passwd = getpwnam(SwooleG.user);
-                if(passwd != NULL) 
-                {
-                    if (0 > setuid(passwd->pw_uid)) 
-                    {
-                        swSysError("setuid to [%s] failed.", SwooleG.user);
-                    }
-                }
-                else
-                {
-                    swSysError("get user [%s] info failed.", SwooleG.user);
-                }
-            }
-        }
-
         if (pool->onWorkerStart != NULL)
         {
             pool->onWorkerStart(pool, worker->id);
@@ -250,16 +266,16 @@ pid_t swProcessPool_spawn(swWorker *worker)
         {
             swHashMap_del_int(pool->map, worker->pid);
         }
-        worker->del = 0;
+        worker->deleted = 0;
         worker->pid = pid;
         //insert new process
-        swHashMap_add_int(pool->map, pid, worker, NULL);
+        swHashMap_add_int(pool->map, pid, worker);
         break;
     }
     return pid;
 }
 
-static int swProcessPool_worker_start(swProcessPool *pool, swWorker *worker)
+static int swProcessPool_worker_loop(swProcessPool *pool, swWorker *worker)
 {
     struct
     {
@@ -285,20 +301,23 @@ static int swProcessPool_worker_start(swProcessPool *pool, swWorker *worker)
      */
     out.buf.info.from_fd = worker->id;
 
-    if (SwooleG.task_dispatch_mode)
+    if (pool->dispatch_mode == SW_DISPATCH_QUEUE)
     {
-        out.mtype = worker->id + 1;
+        out.mtype = 0;
     }
     else
     {
-        out.mtype = 0;
+        out.mtype = worker->id + 1;
     }
 
     while (SwooleG.running > 0 && task_n > 0)
     {
+        /**
+         * fetch task
+         */
         if (pool->use_msgqueue)
         {
-            n = pool->queue.out(&pool->queue, (swQueue_data *) &out, sizeof(out.buf));
+            n = swMsgQueue_pop(pool->queue, (swQueue_data *) &out, sizeof(out.buf));
             if (n < 0 && errno != EINTR)
             {
                 swSysError("[Worker#%d] msgrcv() failed.", worker->id);
@@ -313,17 +332,35 @@ static int swProcessPool_worker_start(swProcessPool *pool, swWorker *worker)
             }
         }
 
+        /**
+         * timer
+         */
         if (n < 0)
         {
             if (errno == EINTR && SwooleG.signal_alarm)
             {
-                SwooleG.timer.select(&SwooleG.timer);
+                alarm_handler: SwooleG.signal_alarm = 0;
+                swTimer_select(&SwooleG.timer);
             }
             continue;
         }
 
+        /**
+         * do task
+         */
+        SwooleWG.worker->status = SW_WORKER_BUSY;
         ret = pool->onTask(pool, &out.buf);
-        if (ret > 0 && !worker_task_always)
+        SwooleWG.worker->status = SW_WORKER_IDLE;
+
+        /**
+         * timer
+         */
+        if (SwooleG.signal_alarm)
+        {
+            goto alarm_handler;
+        }
+
+        if (ret >= 0 && !worker_task_always)
         {
             task_n--;
         }
@@ -336,8 +373,7 @@ static int swProcessPool_worker_start(swProcessPool *pool, swWorker *worker)
  */
 int swProcessPool_add_worker(swProcessPool *pool, swWorker *worker)
 {
-    worker->pool = pool;
-    swHashMap_add_int(pool->map, worker->pid, worker, NULL);
+    swHashMap_add_int(pool->map, worker->pid, worker);
     return SW_OK;
 }
 
@@ -346,6 +382,7 @@ int swProcessPool_wait(swProcessPool *pool)
     int pid, new_pid;
     int reload_worker_i = 0;
     int ret;
+    int status;
 
     swWorker *reload_workers;
     reload_workers = sw_calloc(pool->worker_num, sizeof(swWorker));
@@ -357,7 +394,7 @@ int swProcessPool_wait(swProcessPool *pool)
 
     while (SwooleG.running)
     {
-        pid = wait(NULL);
+        pid = wait(&status);
         if (pid < 0)
         {
             if (pool->reloading == 0)
@@ -382,13 +419,25 @@ int swProcessPool_wait(swProcessPool *pool)
             swWorker *exit_worker = swHashMap_find_int(pool->map, pid);
             if (exit_worker == NULL)
             {
-                swWarn("[Manager]unknow worker[pid=%d]", pid);
+                if (pool->onWorkerNotFound)
+                {
+                    pool->onWorkerNotFound(pool, pid);
+                }
+                else
+                {
+                    swWarn("[Manager]unknow worker[pid=%d]", pid);
+                }
                 continue;
+            }
+            if (!WIFEXITED(status))
+            {
+                swWarn("worker#%d abnormal exit, status=%d, signal=%d", exit_worker->id, WEXITSTATUS(status),  WTERMSIG(status));
             }
             new_pid = swProcessPool_spawn(exit_worker);
             if (new_pid < 0)
             {
                 swWarn("Fork worker process failed. Error: %s [%d]", strerror(errno), errno);
+                sw_free(reload_workers);
                 return SW_ERR;
             }
             swHashMap_del_int(pool->map, pid);
@@ -413,6 +462,7 @@ int swProcessPool_wait(swProcessPool *pool)
             reload_worker_i++;
         }
     }
+    sw_free(reload_workers);
     return SW_OK;
 }
 
@@ -430,5 +480,15 @@ static void swProcessPool_free(swProcessPool *pool)
         }
         sw_free(pool->pipes);
     }
-    swHashMap_free(pool->map);
+    else if (pool->msgqueue_key == 0)
+    {
+        pool->queue->remove = 1;
+        swMsgQueue_free(pool->queue);
+    }
+
+    if (pool->map)
+    {
+        swHashMap_free(pool->map);
+    }
 }
+

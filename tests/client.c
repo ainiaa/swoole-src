@@ -2,23 +2,29 @@
 #include "swoole.h"
 #include "Client.h"
 
-swReactor main_reactor;
+static swReactor main_reactor;
 
-void dns_callback(void *ptr)
+void dns_callback(char *domain, swDNSResolver_result *result, void *data)
 {
+    printf("domain [%s]\n", domain);
+    int i;
+    for (i = 0; i < result->num; i++)
+    {
+        printf("ip[%d]: %s\n", i, result->hosts[i].address);
+    }
+    printf("private data=%s\n", (char *) data);
+}
 
+swUnitTest(dnslookup_test)
+{
+    swReactor_create(&main_reactor, 1024);
+    SwooleG.main_reactor = &main_reactor;
+    swDNSResolver_request("www.baidu.com", dns_callback, "hello");
+    return main_reactor.wait(&main_reactor, NULL);
 }
 
 swUnitTest(client_test)
 {
-    swReactor_auto(&main_reactor, 1024);
-    SwooleG.main_reactor = &main_reactor;
-
-    uchar domain[64] = "www.baidu.com";
-    swDNSResolver_request(domain, dns_callback);
-
-    return main_reactor.wait(&main_reactor, NULL);
-
 	int ret;
 	swClient cli, cli2;
 	char buf[128];
@@ -37,7 +43,7 @@ swUnitTest(client_test)
 		return -1;
 	}
 
-	ret = cli.send(&cli, SW_STRL("TCP: hello world"));
+	ret = cli.send(&cli, SW_STRL("TCP: hello world"), 0);
 	if (ret < 0)
 	{
 		printf("send fail.\n");
@@ -66,7 +72,7 @@ swUnitTest(client_test)
 		printf("connect fail.\n");
 		return -1;
 	}
-	ret = cli2.send(&cli2, SW_STRL("UDP: hello world"));
+	ret = cli2.send(&cli2, SW_STRL("UDP: hello world"), 0);
 	if (ret < 0)
 	{
 		printf("send fail.\n");

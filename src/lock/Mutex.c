@@ -8,7 +8,7 @@
   | http://www.apache.org/licenses/LICENSE-2.0.html                      |
   | If you did not receive a copy of the Apache2.0 license and are unable|
   | to obtain it through the world-wide-web, please send a note to       |
-  | license@php.net so we can mail you a copy immediately.               |
+  | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
   | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
   +----------------------------------------------------------------------+
@@ -70,13 +70,13 @@ int swMutex_lockwait(swLock *lock, int timeout_msec)
 {
     int sub = 1;
     int sleep_ms = 1000;
-    
+
     if (timeout_msec > 100)
     {
         sub = 10;
         sleep_ms = 10000;
     }
-    
+
     while( timeout_msec > 0)
     {
         if (pthread_mutex_trylock(&lock->object.mutex._lock) == 0)
@@ -95,5 +95,6 @@ int swMutex_lockwait(swLock *lock, int timeout_msec)
 
 static int swMutex_free(swLock *lock)
 {
+    pthread_mutexattr_destroy(&lock->object.mutex.attr);
     return pthread_mutex_destroy(&lock->object.mutex._lock);
 }

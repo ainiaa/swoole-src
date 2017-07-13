@@ -8,7 +8,7 @@
   | http://www.apache.org/licenses/LICENSE-2.0.html                      |
   | If you did not receive a copy of the Apache2.0 license and are unable|
   | to obtain it through the world-wide-web, please send a note to       |
-  | license@php.net so we can mail you a copy immediately.               |
+  | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
   | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
   +----------------------------------------------------------------------+
@@ -25,28 +25,23 @@
 
 typedef struct _swTableRow
 {
+#if SW_TABLE_USE_SPINLOCK
     sw_atomic_t lock;
-
-    /**
-     * string crc32
-     */
-    uint32_t crc32;
-
+#else
+    pthread_mutex_t lock;
+#endif
     /**
      * 1:used, 0:empty
      */
     uint8_t active;
-
-    /**
-     * iterator
-     */
-    uint32_t list_index;
-
     /**
      * next slot
      */
     struct _swTableRow *next;
-
+    /**
+     * Hash Key
+     */
+    char key[SW_TABLE_KEY_SIZE];
     char data[0];
 } swTableRow;
 
@@ -54,9 +49,7 @@ typedef struct
 {
     uint32_t absolute_index;
     uint32_t collision_index;
-    uint32_t skip_count;
-
-    swTableRow *tmp_row;
+    swTableRow *row;
 } swTable_iterator;
 
 typedef struct
@@ -65,6 +58,7 @@ typedef struct
     uint16_t column_num;
     swLock lock;
     uint32_t size;
+    uint32_t mask;
     uint32_t item_size;
 
     /**
@@ -75,11 +69,6 @@ typedef struct
     swTableRow **rows;
     swMemoryPool *pool;
 
-    /**
-     * for iterator
-     */
-    swTableRow **rows_list;
-    sw_atomic_t list_n;
     uint32_t compress_threshold;
 
     swTable_iterator *iterator;
@@ -90,7 +79,7 @@ typedef struct
 typedef struct
 {
    uint8_t type;
-   uint16_t size;
+   uint32_t size;
    swString* name;
    uint16_t index;
 } swTableColumn;
@@ -98,11 +87,12 @@ typedef struct
 enum swoole_table_type
 {
     SW_TABLE_INT = 1,
-
     SW_TABLE_INT8,
     SW_TABLE_INT16,
     SW_TABLE_INT32,
+#ifdef __x86_64__
     SW_TABLE_INT64,
+#endif
     SW_TABLE_FLOAT,
     SW_TABLE_STRING,
 };
@@ -122,8 +112,8 @@ swTable* swTable_new(uint32_t rows_size);
 int swTable_create(swTable *table);
 void swTable_free(swTable *table);
 int swTableColumn_add(swTable *table, char *name, int len, int type, int size);
-swTableRow* swTableRow_set(swTable *table, char *key, int keylen);
-swTableRow* swTableRow_get(swTable *table, char *key, int keylen);
+swTableRow* swTableRow_set(swTable *table, char *key, int keylen, swTableRow **rowlock);
+swTableRow* swTableRow_get(swTable *table, char *key, int keylen, swTableRow **rowlock);
 
 void swTable_iterator_rewind(swTable *table);
 swTableRow* swTable_iterator_current(swTable *table);
@@ -133,6 +123,24 @@ int swTableRow_del(swTable *table, char *key, int keylen);
 static sw_inline swTableColumn* swTableColumn_get(swTable *table, char *column_key, int keylen)
 {
     return swHashMap_find(table->columns, column_key, keylen);
+}
+
+static sw_inline void swTableRow_lock(swTableRow *row)
+{
+#if SW_TABLE_USE_SPINLOCK
+    sw_spinlock(&row->lock);
+#else
+    pthread_mutex_lock(&row->lock);
+#endif
+}
+
+static sw_inline void swTableRow_unlock(swTableRow *row)
+{
+#if SW_TABLE_USE_SPINLOCK
+    sw_spinlock_release(&row->lock);
+#else
+    pthread_mutex_unlock(&row->lock);
+#endif
 }
 
 typedef uint32_t swTable_string_length_t;
@@ -150,9 +158,11 @@ static sw_inline void swTableRow_set_value(swTableRow *row, swTableColumn * col,
     case SW_TABLE_INT32:
         memcpy(row->data + col->index, value, 4);
         break;
+#ifdef __x86_64__
     case SW_TABLE_INT64:
         memcpy(row->data + col->index, value, 8);
         break;
+#endif
     case SW_TABLE_FLOAT:
         memcpy(row->data + col->index, value, sizeof(double));
         break;

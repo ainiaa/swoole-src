@@ -8,7 +8,7 @@
   | http://www.apache.org/licenses/LICENSE-2.0.html                      |
   | If you did not receive a copy of the Apache2.0 license and are unable|
   | to obtain it through the world-wide-web, please send a note to       |
-  | license@php.net so we can mail you a copy immediately.               |
+  | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
   | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
   +----------------------------------------------------------------------+
@@ -16,47 +16,57 @@
 
 #include "swoole.h"
 #include "Connection.h"
+#include "async.h"
+
+#ifdef SW_USE_MALLOC_TRIM
+#ifdef __APPLE__
+#include <sys/malloc.h>
+#else
+#include <malloc.h>
+#endif
+#endif
+
+#ifdef SW_COROUTINE
+#include "coroutine.h"
+#endif
 
 static void swReactor_onTimeout_and_Finish(swReactor *reactor);
 static void swReactor_onTimeout(swReactor *reactor);
 static void swReactor_onFinish(swReactor *reactor);
-static int swReactor_write(swReactor *reactor, int fd, void *buf, int n);
+static int swReactor_defer(swReactor *reactor, swCallback callback, void *data);
 
-int swReactor_auto(swReactor *reactor, int max_event)
+int swReactor_create(swReactor *reactor, int max_event)
 {
     int ret;
-
     bzero(reactor, sizeof(swReactor));
 
-    //event less than SW_REACTOR_MINEVENTS, use poll/select
-    if (max_event <= SW_REACTOR_MINEVENTS)
-    {
-#ifdef SW_MAINREACTOR_USE_POLL
-        ret = swReactorPoll_create(reactor, SW_REACTOR_MINEVENTS);
-#else
-        ret = swReactorSelect_create(reactor);
-#endif
-    }
-    //use epoll or kqueue
-    else
-    {
 #ifdef HAVE_EPOLL
-        ret = swReactorEpoll_create(reactor, max_event);
+    ret = swReactorEpoll_create(reactor, max_event);
 #elif defined(HAVE_KQUEUE)
-        ret = swReactorKqueue_create(reactor, max_event);
-#elif defined(SW_MAINREACTOR_USE_POLL)
-        ret = swReactorPoll_create(reactor, max_event);
+    ret = swReactorKqueue_create(reactor, max_event);
+#elif defined(HAVE_POLL)
+    ret = swReactorPoll_create(reactor, max_event);
 #else
-        ret = swReactorSelect_create(SwooleG.main_reactor);
+    ret = swReactorSelect_create(reactor);
 #endif
-    }
+
+    reactor->running = 1;
 
     reactor->setHandle = swReactor_setHandle;
+
     reactor->onFinish = swReactor_onFinish;
     reactor->onTimeout = swReactor_onTimeout;
 
     reactor->write = swReactor_write;
+    reactor->defer = swReactor_defer;
     reactor->close = swReactor_close;
+
+    reactor->socket_array = swArray_new(1024, sizeof(swConnection));
+    if (!reactor->socket_array)
+    {
+        swWarn("create socket array failed.");
+        return SW_ERR;
+    }
 
     return ret;
 }
@@ -105,70 +115,70 @@ int swReactor_setHandle(swReactor *reactor, int _fdtype, swReactor_handle handle
     return SW_OK;
 }
 
+static int swReactor_defer(swReactor *reactor, swCallback callback, void *data)
+{
+    swDefer_callback *cb = sw_malloc(sizeof(swDefer_callback));
+    if (!cb)
+    {
+        swWarn("malloc(%ld) failed.", sizeof(swDefer_callback));
+        return SW_ERR;
+    }
+    cb->callback = callback;
+    cb->data = data;
+    LL_APPEND(reactor->defer_callback_list, cb);
+    return SW_OK;
+}
+
 swConnection* swReactor_get(swReactor *reactor, int fd)
 {
-    if (fd >= reactor->max_socket)
+    assert(fd < SwooleG.max_sockets);
+
+    if (reactor->thread)
     {
-        if (reactor->thread || fd > SwooleG.max_sockets)
-        {
-            swWarn("fd[%d] is invalid.", fd);
-            return NULL;
-        }
-
-        int max_socket = fd * 2;
-        if (max_socket > SwooleG.max_sockets)
-        {
-            max_socket = SwooleG.max_sockets + 1;
-        }
-
-        if (reactor->sockets == NULL)
-        {
-            reactor->sockets = sw_calloc(max_socket, sizeof(swConnection));
-            reactor->max_socket = max_socket;
-        }
-        else
-        {
-            reactor->sockets = sw_realloc(reactor->sockets, max_socket * sizeof(swConnection));
-            if (reactor->sockets)
-            {
-                bzero((void *) reactor->sockets + reactor->max_socket * sizeof(swConnection),
-                        (max_socket - reactor->max_socket) * sizeof(swConnection));
-            }
-            reactor->max_socket = max_socket;
-        }
-
-        if (!reactor->sockets)
-        {
-            swSysError("Fatal Error: malloc(%ld) failed.", reactor->max_socket * sizeof(swConnection));
-            return NULL;
-        }
+        return &reactor->socket_list[fd];
     }
 
-    swConnection *socket = &reactor->sockets[fd];
+    swConnection *socket = swArray_alloc(reactor->socket_array, fd);
+    if (socket == NULL)
+    {
+        return NULL;
+    }
+
     if (!socket->active)
     {
         socket->fd = fd;
-        socket->active = 1;
     }
+
     return socket;
 }
 
 int swReactor_add(swReactor *reactor, int fd, int fdtype)
 {
+    assert (fd <= SwooleG.max_sockets);
+
     swConnection *socket = swReactor_get(reactor, fd);
 
-    socket->type = swReactor_fdtype(fdtype);
+    socket->fdtype = swReactor_fdtype(fdtype);
     socket->events = swReactor_events(fdtype);
+    socket->removed = 0;
 
-    swTraceLog(SW_TRACE_REACTOR, "fd=%d, type=%d, events=%d", fd, socket->type, socket->events);
+    swTraceLog(SW_TRACE_REACTOR, "fd=%d, type=%d, events=%d", fd, socket->socket_type, socket->events);
 
     return SW_OK;
 }
 
 int swReactor_del(swReactor *reactor, int fd)
 {
-    reactor->sockets[fd].events = 0;
+    swConnection *socket = swReactor_get(reactor, fd);
+    socket->events = 0;
+    socket->removed = 1;
     return SW_OK;
+}
+
+void swReactor_set(swReactor *reactor, int fd, int fdtype)
+{
+    swConnection *socket = swReactor_get(reactor, fd);
+    socket->events = swReactor_events(fdtype);
 }
 
 /**
@@ -179,73 +189,167 @@ static void swReactor_onTimeout_and_Finish(swReactor *reactor)
     //check timer
     if (reactor->check_timer)
     {
-        SwooleG.timer.select(&SwooleG.timer);
+        swTimer_select(&SwooleG.timer);
     }
-    if (SwooleG.serv && swIsMaster())
+
+#ifdef SW_COROUTINE
+    //coro timeout
+    if (!swIsMaster()) {
+        coro_handle_timeout();
+    }
+#endif
+
+    //server master
+    if (SwooleG.serv && SwooleTG.update_time)
     {
         swoole_update_time();
+        int32_t timeout_msec = SwooleG.main_reactor->timeout_msec;
+        if (timeout_msec < 0 || timeout_msec > 1000)
+        {
+            SwooleG.main_reactor->timeout_msec = 1000;
+        }
     }
+    //server worker
+    swWorker *worker = SwooleWG.worker;
+    if (worker != NULL)
+    {
+        if (SwooleWG.reload == 1)
+        {
+            SwooleWG.reload_count++;
+
+            if (reactor->event_num <= 2 || SwooleWG.reload_count >= SW_MAX_RELOAD_WAIT)
+            {
+                reactor->running = 0;
+            }
+        }
+    }
+    //client
+    if (SwooleG.serv == NULL && SwooleG.timer.num <= 0)
+    {
+        if (SwooleAIO.init && reactor->event_num == 1 && SwooleAIO.task_num == 0)
+        {
+            reactor->running = 0;
+        }
+        else if (reactor->event_num == 0)
+        {
+            reactor->running = 0;
+        }
+    }
+
+#ifdef SW_USE_MALLOC_TRIM
+    if (reactor->last_mallc_trim_time < SwooleGS->now - SW_MALLOC_TRIM_INTERVAL)
+    {
+        malloc_trim(SW_MALLOC_TRIM_PAD);
+        reactor->last_mallc_trim_time = SwooleGS->now;
+    }
+#endif
 }
 
 static void swReactor_onTimeout(swReactor *reactor)
 {
     swReactor_onTimeout_and_Finish(reactor);
+
+    if (reactor->disable_accept)
+    {
+        reactor->enable_accept(reactor);
+        reactor->disable_accept = 0;
+    }
 }
 
 static void swReactor_onFinish(swReactor *reactor)
 {
-    //client exit
-    if (SwooleG.serv == NULL && reactor->event_num == 0)
-    {
-        SwooleG.running = 0;
-    }
     //check signal
     if (reactor->singal_no)
     {
         swSignal_callback(reactor->singal_no);
         reactor->singal_no = 0;
     }
+    //defer callback
+    swDefer_callback *cb, *tmp;
+    LL_FOREACH(reactor->defer_callback_list, cb)
+    {
+        cb->callback(cb->data);
+    }
+    LL_FOREACH_SAFE(reactor->defer_callback_list, cb, tmp)
+    {
+        sw_free(cb);
+    }
+    reactor->defer_callback_list = NULL;
     swReactor_onTimeout_and_Finish(reactor);
 }
 
 int swReactor_close(swReactor *reactor, int fd)
 {
-    swConnection *socket = &reactor->sockets[fd];
-
-    if (socket->out_buffer != NULL)
+    swConnection *socket = swReactor_get(reactor, fd);
+    if (socket->out_buffer)
     {
         swBuffer_free(socket->out_buffer);
-        socket->out_buffer = NULL;
     }
-    if (socket->in_buffer != NULL)
+    if (socket->in_buffer)
     {
         swBuffer_free(socket->in_buffer);
-        socket->in_buffer = NULL;
     }
-#ifdef SW_USE_OPENSSL
-    if (socket->ssl)
+    if (socket->websocket_buffer)
     {
-        swSSL_close(socket);
+        swString_free(socket->websocket_buffer);
     }
-#endif
-
     bzero(socket, sizeof(swConnection));
-
+    socket->removed = 1;
     return close(fd);
 }
 
-static int swReactor_write(swReactor *reactor, int fd, void *buf, int n)
+int swReactor_write(swReactor *reactor, int fd, void *buf, int n)
 {
     int ret;
     swConnection *socket = swReactor_get(reactor, fd);
     swBuffer *buffer = socket->out_buffer;
 
+    if (socket->fd == 0)
+    {
+        socket->fd = fd;
+    }
+
+    if (socket->buffer_size == 0)
+    {
+        socket->buffer_size = SwooleG.socket_buffer_size;
+    }
+
+    if (n > socket->buffer_size)
+    {
+        swoole_error_log(SW_LOG_WARNING, SW_ERROR_PACKAGE_LENGTH_TOO_LARGE, "data is too large, cannot exceed buffer size.");
+        return SW_ERR;
+    }
+
     if (swBuffer_empty(buffer))
     {
+        if (socket->ssl_send)
+        {
+            goto do_buffer;
+        }
+
+        do_send:
         ret = swConnection_send(socket, buf, n, 0);
 
-        if (ret < 0 && errno == EAGAIN)
+        if (ret > 0)
         {
+            if (n == ret)
+            {
+                return ret;
+            }
+            else
+            {
+                buf += ret;
+                n -= ret;
+                goto do_buffer;
+            }
+        }
+#ifdef HAVE_KQUEUE
+        else if (errno == EAGAIN || errno == ENOBUFS)
+#else
+        else if (errno == EAGAIN)
+#endif
+        {
+            do_buffer:
             if (!socket->out_buffer)
             {
                 buffer = swBuffer_new(sizeof(swEventData));
@@ -261,18 +365,48 @@ static int swReactor_write(swReactor *reactor, int fd, void *buf, int n)
 
             if (socket->events & SW_EVENT_READ)
             {
-                SwooleG.main_reactor->set(SwooleG.main_reactor, fd, socket->type | socket->events);
+                if (reactor->set(reactor, fd, socket->fdtype | socket->events) < 0)
+                {
+                    swSysError("reactor->set(%d, SW_EVENT_WRITE) failed.", fd);
+                }
             }
             else
             {
-                SwooleG.main_reactor->add(SwooleG.main_reactor, fd, socket->type | socket->events);
+                if (reactor->add(reactor, fd, socket->fdtype | SW_EVENT_WRITE) < 0)
+                {
+                    swSysError("reactor->add(%d, SW_EVENT_WRITE) failed.", fd);
+                }
             }
-            goto append_pipe_buffer;
+
+            goto append_buffer;
+        }
+        else if (errno == EINTR)
+        {
+            goto do_send;
+        }
+        else
+        {
+            return SW_ERR;
         }
     }
     else
     {
-        append_pipe_buffer:
+        append_buffer:
+
+        if (buffer->length > socket->buffer_size)
+        {
+            swoole_error_log(SW_LOG_WARNING, SW_ERROR_OUTPUT_BUFFER_OVERFLOW, "socket#%d output buffer overflow.", fd);
+            if (SwooleG.socket_dontwait)
+            {
+                return SW_ERR;
+            }
+            else
+            {
+                swYield();
+                swSocket_wait(fd, SW_SOCKET_OVERFLOW_WAIT, SW_EVENT_WRITE);
+            }
+        }
+
         if (swBuffer_append(buffer, buf, n) < 0)
         {
             return SW_ERR;
@@ -286,7 +420,7 @@ int swReactor_onWrite(swReactor *reactor, swEvent *ev)
     int ret;
     int fd = ev->fd;
 
-    swConnection *socket = &reactor->sockets[fd];
+    swConnection *socket = swReactor_get(reactor, fd);
     swBuffer_trunk *chunk = NULL;
     swBuffer *buffer = socket->out_buffer;
 
@@ -325,21 +459,36 @@ int swReactor_onWrite(swReactor *reactor, swEvent *ev)
     //remove EPOLLOUT event
     if (swBuffer_empty(buffer))
     {
-        socket->events &= ~SW_EVENT_WRITE;
-
         if (socket->events & SW_EVENT_READ)
         {
-            ret = reactor->set(reactor, fd, socket->type | socket->events);
+            socket->events &= (~SW_EVENT_WRITE);
+            if (reactor->set(reactor, fd, socket->fdtype | socket->events) < 0)
+            {
+                swSysError("reactor->set(%d, SW_EVENT_READ) failed.", fd);
+            }
         }
         else
         {
-            ret = reactor->del(reactor, fd);
-        }
-        if (ret < 0)
-        {
-            swSysError("reactor->set() failed.");
+            if (reactor->del(reactor, fd) < 0)
+            {
+                swSysError("reactor->del(%d) failed.", fd);
+            }
         }
     }
+
     return SW_OK;
 }
 
+int swReactor_wait_write_buffer(swReactor *reactor, int fd)
+{
+    swConnection *conn = swReactor_get(reactor, fd);
+    swEvent event;
+
+    if (conn->out_buffer)
+    {
+        swSetBlock(fd);
+        event.fd = fd;
+        return swReactor_onWrite(reactor, &event);
+    }
+    return SW_OK;
+}
